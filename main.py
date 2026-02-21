@@ -46,7 +46,7 @@ SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # Local inference (reuses persistent model handle)
 # ---------------------------------------------------------------------------
-def generate_cactus(messages, tools):
+def generate_cactus(messages, tools, tool_rag_top_k=2):
     """Run function calling on-device via FunctionGemma + Cactus."""
     try:
         model = _get_model()
@@ -61,7 +61,7 @@ def generate_cactus(messages, tools):
             force_tools=True,
             max_tokens=256,
             stop_sequences=["<|im_end|>", "<end_of_turn>"],
-            tool_rag_top_k=2,
+            tool_rag_top_k=tool_rag_top_k,
         )
 
         try:
@@ -210,6 +210,62 @@ def _validate(result, tools):
             if req not in args or args[req] is None or args[req] == "":
                 return False
     return True
+
+
+# ===================================================================
+# TOOL RAG — lexical retrieval to filter relevant tools per query
+# ===================================================================
+
+_TOOL_QUERY_KEYWORDS = {
+    "get_weather": ["weather", "forecast", "temperature", "location", "city", "check", "how's", "what's", "rain", "sunny"],
+    "set_alarm": ["alarm", "wake", "hour", "minute", "time", "am", "pm", "clock"],
+    "send_message": ["message", "send", "text", "recipient", "contact", "say", "saying", "tell"],
+    "create_reminder": ["reminder", "remind", "title", "time", "about", "groceries", "meeting", "medicine"],
+    "search_contacts": ["search", "find", "look", "contacts", "query", "lookup"],
+    "play_music": ["play", "music", "song", "playlist", "beats", "classical", "jazz", "lo-fi"],
+    "set_timer": ["timer", "minutes", "countdown", "minute"],
+}
+
+
+def _tool_rag_filter(query, tools, top_k=4):
+    """
+    Filter tools by relevance to query using lexical keyword overlap.
+    Returns top-k tools most likely to be needed for this query.
+    Reduces model confusion when many tools are available.
+    """
+    if len(tools) <= top_k:
+        return tools
+
+    q_lower = query.lower()
+    q_words = set(re.findall(r"\b[a-z]+", q_lower))
+    q_words.discard("a")
+    q_words.discard("an")
+    q_words.discard("the")
+    q_words.discard("to")
+    q_words.discard("for")
+    q_words.discard("in")
+    q_words.discard("at")
+    q_words.discard("me")
+    q_words.discard("my")
+
+    scores = []
+    for t in tools:
+        name = t.get("name", "").lower().replace("_", " ")
+        desc = t.get("description", "").lower()
+        tool_text = f"{name} {desc}"
+        tool_words = set(re.findall(r"\b[a-z]+", tool_text))
+
+        explicit = set(_TOOL_QUERY_KEYWORDS.get(t.get("name", ""), []))
+        tool_words.update(explicit)
+
+        overlap = len(q_words & tool_words)
+        if overlap > 0:
+            scores.append((overlap, t))
+        else:
+            scores.append((0, t))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+    return [t for _, t in scores[:top_k]]
 
 
 # ===================================================================
@@ -617,7 +673,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         with ThreadPoolExecutor(max_workers=1) as bg:
             cloud_future = bg.submit(generate_cloud, messages_for_model, tools)
 
-            local1 = generate_cactus(messages_for_model, tools)
+            local_tools = _tool_rag_filter(user_text, tools, top_k=4) if len(tools) > 4 else tools
+            rag_top_k = 0 if len(local_tools) <= 3 else 2
+            local1 = generate_cactus(messages_for_model, local_tools, tool_rag_top_k=rag_top_k)
             if _deep_validate(local1, tools, user_text):
                 local_done_ms = (time.time() - start) * 1000
                 local1["function_calls"] = [
@@ -633,7 +691,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 }
                 return local1
 
-            local2 = generate_cactus(messages_for_model, tools)
+            local2 = generate_cactus(messages_for_model, local_tools, tool_rag_top_k=rag_top_k)
             if _deep_validate(local2, tools, user_text):
                 local_done_ms = (time.time() - start) * 1000
                 local2["function_calls"] = [
@@ -689,8 +747,10 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         for i in range(n_subs):
             sub_text = resolved_subs[i]
             sub_msgs = [{"role": "user", "content": sub_text}]
+            sub_tools = _tool_rag_filter(sub_text, tools, top_k=4) if len(tools) > 3 else tools
+            sub_rag_k = 0 if len(sub_tools) <= 3 else 2
 
-            p1 = generate_cactus(sub_msgs, tools)
+            p1 = generate_cactus(sub_msgs, sub_tools, tool_rag_top_k=sub_rag_k)
             _normalize_model_output(p1, tools, sub_text)
             if not p1.get("cloud_handoff", False) and _deep_validate(p1, tools, sub_text):
                 cleaned_call = {
@@ -704,7 +764,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 })
                 continue
 
-            p2 = generate_cactus(sub_msgs, tools)
+            p2 = generate_cactus(sub_msgs, sub_tools, tool_rag_top_k=sub_rag_k)
             _normalize_model_output(p2, tools, sub_text)
             if not p2.get("cloud_handoff", False) and _deep_validate(p2, tools, sub_text):
                 cleaned_call = {
