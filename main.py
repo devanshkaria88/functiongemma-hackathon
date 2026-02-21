@@ -11,12 +11,29 @@ from google.genai import types
 
 
 _local_model = None
+_model_pool = []
+_pool_lock = None
 
 def _get_model():
     global _local_model
     if _local_model is None:
         _local_model = cactus_init(functiongemma_path)
     return _local_model
+
+
+def _get_pool_model(index):
+    """Get or create a model handle for parallel execution."""
+    import threading
+    global _pool_lock
+    if _pool_lock is None:
+        _pool_lock = threading.Lock()
+
+    with _pool_lock:
+        while len(_model_pool) <= index:
+            _model_pool.append(None)
+        if _model_pool[index] is None:
+            _model_pool[index] = cactus_init(functiongemma_path)
+    return _model_pool[index]
 
 
 SYSTEM_PROMPT = (
@@ -51,6 +68,33 @@ def generate_cactus(messages, tools):
         except json.JSONDecodeError:
             return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
 
+        return {
+            "function_calls": raw.get("function_calls", []),
+            "total_time_ms": raw.get("total_time_ms", 0),
+            "confidence": raw.get("confidence", 0),
+        }
+    except Exception:
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+
+
+def _cactus_on_pool(pool_index, messages, tools):
+    """Run cactus_complete on a specific pool model (thread-safe)."""
+    try:
+        model = _get_pool_model(pool_index)
+        cactus_reset(model)
+        cactus_tools = [{"type": "function", "function": t} for t in tools]
+        raw_str = cactus_complete(
+            model,
+            [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            tools=cactus_tools,
+            force_tools=True,
+            max_tokens=128,
+            stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        )
+        try:
+            raw = json.loads(raw_str)
+        except json.JSONDecodeError:
+            return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
         return {
             "function_calls": raw.get("function_calls", []),
             "total_time_ms": raw.get("total_time_ms", 0),
@@ -164,17 +208,69 @@ def _validate(result, tools):
 
 
 # ===================================================================
-# HYBRID ROUTING — always run both, maximize all scoring components
+# QUERY DECOMPOSITION — split multi-intent into simple sub-queries
 # ===================================================================
 
-def _is_single_intent(text):
-    """Check if query has only one intent (no conjunctions splitting actions)."""
-    text_lower = text.lower()
-    for marker in [" and ", " then ", " also ", " plus "]:
-        if marker in text_lower:
-            return False
-    return True
+_SPLIT_MARKERS = [", and ", " and ", ", then ", " then ", ", also ", " also ", ", plus ", " plus ", ", "]
 
+
+def _split_intents(text):
+    """Split a multi-intent query into individual sub-queries."""
+    text_lower = text.lower()
+    best_marker = None
+    best_pos = -1
+    for marker in _SPLIT_MARKERS:
+        pos = text_lower.find(marker)
+        if pos != -1 and (best_pos == -1 or pos < best_pos):
+            best_pos = pos
+            best_marker = marker
+
+    if best_marker is None:
+        return [text]
+
+    first = text[:best_pos].strip()
+    rest = text[best_pos + len(best_marker):].strip()
+
+    rest_parts = _split_intents(rest)
+    return [first] + rest_parts
+
+
+def _resolve_pronouns(sub_text, previous_calls):
+    """Replace pronouns (him/her/them) with names from previous call results."""
+    pronouns = ["him", "her", "them", "his", "he", "she", "they"]
+    text_lower = sub_text.lower()
+    has_pronoun = any(f" {p} " in f" {text_lower} " for p in pronouns)
+    if not has_pronoun or not previous_calls:
+        return sub_text
+
+    last_name = None
+    for call in reversed(previous_calls):
+        for val in call.get("arguments", {}).values():
+            if isinstance(val, str) and val and val[0].isupper() and len(val) < 30:
+                last_name = val
+                break
+        if last_name:
+            break
+
+    if not last_name:
+        return sub_text
+
+    for p in pronouns:
+        lower = sub_text.lower()
+        idx = lower.find(f" {p} ")
+        if idx == -1:
+            idx = lower.find(f" {p}.")
+        if idx == -1:
+            idx = lower.find(f" {p},")
+        if idx != -1:
+            sub_text = sub_text[:idx + 1] + last_name + sub_text[idx + 1 + len(p):]
+
+    return sub_text
+
+
+# ===================================================================
+# VALIDATION
+# ===================================================================
 
 def _all_string_params(tool):
     """Check if a tool only has string parameters (no integer/numeric)."""
@@ -226,61 +322,134 @@ def _deep_validate(result, tools, user_text):
 
 def _count_expected_calls(text):
     """Estimate how many function calls a query needs."""
-    text_lower = text.lower()
-    count = 1
-    for marker in [" and ", " then ", " also ", " plus "]:
-        count += text_lower.count(marker)
-    return min(count, 5)
+    return len(_split_intents(text))
+
+
+# ===================================================================
+# HYBRID ROUTING — decompose, local-first, cloud fallback
+# ===================================================================
+
+def _pick_best_tool(sub_text, tools):
+    """Pick the single best tool for a sub-query using keyword matching."""
+    text_lower = sub_text.lower()
+    best = None
+    best_score = -1
+    for t in tools:
+        score = 0
+        name_words = t["name"].lower().split("_")
+        for w in name_words:
+            if w in text_lower:
+                score += 3
+        desc_words = t.get("description", "").lower().split()
+        for w in desc_words:
+            if len(w) > 3 and w in text_lower:
+                score += 1
+        if score > best_score:
+            best_score = score
+            best = t
+    return best
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
-    Hybrid routing — local first, cloud only when needed:
-      1. Always try FunctionGemma first (~250ms)
-      2. If local passes deep validation → return as on-device (fast path)
-      3. If local fails → call cloud for accuracy (slow path)
-      4. For multi-intent queries → cloud directly (FunctionGemma can't do these)
+    Hybrid routing with query decomposition and parallel execution:
+
+    SINGLE INTENT:
+      1. Try FunctionGemma → deep validate → return if trusted
+      2. Else cloud fallback
+
+    MULTI-INTENT:
+      1. Split query into sub-queries
+      2. Pick best single tool per sub-query (keyword matching)
+      3. Run ALL sub-queries on separate cactus model instances IN PARALLEL,
+         AND also run cloud in parallel as a safety net
+      4. If all local sub-queries validate → use them (fast, on-device)
+      5. If any fail → cloud result is already ready (no extra wait)
     """
     user_text = " ".join(m["content"] for m in messages if m["role"] == "user").strip()
-    single_intent = _is_single_intent(user_text)
+    sub_queries = _split_intents(user_text)
 
-    # Multi-intent: FunctionGemma can't produce multiple function calls reliably
-    if not single_intent:
+    # ------------------------------------------------------------------
+    # SINGLE INTENT
+    # ------------------------------------------------------------------
+    if len(sub_queries) == 1:
         local = generate_cactus(messages, tools)
+        if _deep_validate(local, tools, user_text):
+            local["function_calls"] = [
+                {"name": c["name"], "arguments": _clean_args(c["arguments"])}
+                for c in local["function_calls"]
+            ]
+            local["source"] = "on-device"
+            return local
+
         cloud = generate_cloud(messages, tools)
-
-        cloud_calls = cloud["function_calls"]
-        expected = _count_expected_calls(user_text)
-
-        if len(cloud_calls) < expected and expected > 1:
-            used_tools = {c["name"] for c in cloud_calls}
-            remaining_tools = [t for t in tools if t["name"] not in used_tools]
-            if remaining_tools:
-                cloud2 = generate_cloud(messages, remaining_tools)
-                cloud["total_time_ms"] += cloud2["total_time_ms"]
-                cloud_calls = cloud_calls + cloud2["function_calls"]
-
         return {
-            "function_calls": cloud_calls,
+            "function_calls": cloud["function_calls"],
             "total_time_ms": local["total_time_ms"] + cloud["total_time_ms"],
             "source": "cloud (fallback)",
         }
 
-    # Single intent: try local first
-    local = generate_cactus(messages, tools)
-    if _deep_validate(local, tools, user_text):
-        local["function_calls"] = [
-            {"name": c["name"], "arguments": _clean_args(c["arguments"])}
-            for c in local["function_calls"]
-        ]
-        local["source"] = "on-device"
-        return local
+    # ------------------------------------------------------------------
+    # MULTI-INTENT — decompose, run local + cloud ALL in parallel
+    # ------------------------------------------------------------------
+    resolved_subs = []
+    for sub_text in sub_queries:
+        resolved_subs.append(_resolve_pronouns(sub_text, []))
 
-    # Local failed validation → cloud fallback
-    cloud = generate_cloud(messages, tools)
+    start = time.time()
+    n_subs = len(resolved_subs)
+    with ThreadPoolExecutor(max_workers=n_subs + 1) as pool:
+        cloud_future = pool.submit(generate_cloud, messages, tools)
+
+        local_futures = {}
+        for i, sub_text in enumerate(resolved_subs):
+            sub_msgs = [{"role": "user", "content": sub_text}]
+            best_tool = _pick_best_tool(sub_text, tools)
+            local_futures[i] = pool.submit(
+                _cactus_on_pool, i, sub_msgs, [best_tool] if best_tool else tools
+            )
+
+        local_results = {i: f.result() for i, f in local_futures.items()}
+        cloud = cloud_future.result()
+    wall_ms = (time.time() - start) * 1000
+
+    all_calls = []
+    all_valid = True
+    for i in range(n_subs):
+        local = local_results[i]
+        sub_text = resolved_subs[i]
+        best_tool = _pick_best_tool(sub_text, tools)
+        tool_list = [best_tool] if best_tool else tools
+
+        if _deep_validate(local, tool_list, sub_text):
+            cleaned_call = {
+                "name": local["function_calls"][0]["name"],
+                "arguments": _clean_args(local["function_calls"][0]["arguments"]),
+            }
+            all_calls.append(cleaned_call)
+        else:
+            all_valid = False
+            break
+
+    if all_valid and len(all_calls) >= n_subs:
+        return {
+            "function_calls": all_calls,
+            "total_time_ms": wall_ms,
+            "source": "on-device",
+        }
+
+    cloud_calls = cloud["function_calls"]
+    if len(cloud_calls) < n_subs:
+        used_tools = {c["name"] for c in cloud_calls}
+        remaining_tools = [t for t in tools if t["name"] not in used_tools]
+        if remaining_tools:
+            cloud2 = generate_cloud(messages, remaining_tools)
+            wall_ms += cloud2["total_time_ms"]
+            cloud_calls = cloud_calls + cloud2["function_calls"]
+
     return {
-        "function_calls": cloud["function_calls"],
-        "total_time_ms": local["total_time_ms"] + cloud["total_time_ms"],
+        "function_calls": cloud_calls,
+        "total_time_ms": wall_ms,
         "source": "cloud (fallback)",
     }
 
