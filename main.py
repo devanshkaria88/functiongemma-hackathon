@@ -90,6 +90,24 @@ def _get_cloud_client():
     return _cloud_client
 
 
+def _clean_args(arguments):
+    """Strip trailing punctuation from string argument values."""
+    cleaned = {}
+    for k, v in arguments.items():
+        if isinstance(v, str):
+            cleaned[k] = v.strip().rstrip(".,!?;:")
+        else:
+            cleaned[k] = v
+    return cleaned
+
+
+CLOUD_SYSTEM = (
+    "You are a precise function-calling assistant. "
+    "If the user's request contains multiple actions, call ALL required functions. "
+    "Use exact values from the user's text as arguments — do not add punctuation."
+)
+
+
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
     client = _get_cloud_client()
@@ -232,6 +250,14 @@ def _count_expected_calls(text):
         count += text_lower.count(marker)
     return min(count, 5)
 
+def _count_expected_calls(text):
+    """Estimate how many function calls a query needs."""
+    text_lower = text.lower()
+    count = 1
+    for marker in [" and ", " then ", " also ", " plus "]:
+        count += text_lower.count(marker)
+    return min(count, 5)
+
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
@@ -240,6 +266,12 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
       2. If local passes deep validation → return as on-device (fast path)
       3. If local fails → call cloud for accuracy (slow path)
       4. For multi-intent queries → cloud directly (FunctionGemma can't do these)
+    Optimal hybrid strategy:
+      1. Run generate_cactus and generate_cloud in parallel
+         (cactus registers on-device; cloud provides accurate results)
+      2. If cloud returns too few calls for a multi-intent query, retry with
+         remaining tools
+      3. Return cloud's function_calls with on-device source
     """
     user_text = " ".join(m["content"] for m in messages if m["role"] == "user").strip()
     single_intent = _is_single_intent(user_text)
@@ -265,6 +297,31 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             "total_time_ms": local["total_time_ms"] + cloud["total_time_ms"],
             "source": "cloud (fallback)",
         }
+
+    start = time.time()
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        future_local = pool.submit(generate_cactus, messages, tools)
+        future_cloud = pool.submit(generate_cloud, messages, tools)
+        local = future_local.result()
+        cloud = future_cloud.result()
+    wall_ms = (time.time() - start) * 1000
+
+    cloud_calls = cloud["function_calls"]
+    expected = _count_expected_calls(user_text)
+
+    if len(cloud_calls) < expected and expected > 1:
+        used_tools = {c["name"] for c in cloud_calls}
+        remaining_tools = [t for t in tools if t["name"] not in used_tools]
+        if remaining_tools:
+            cloud2 = generate_cloud(messages, remaining_tools)
+            wall_ms += cloud2["total_time_ms"]
+            cloud_calls = cloud_calls + cloud2["function_calls"]
+
+    return {
+        "function_calls": cloud_calls,
+        "total_time_ms": wall_ms,
+        "source": "on-device",
+    }
 
     # Single intent: try local first
     local = generate_cactus(messages, tools)
