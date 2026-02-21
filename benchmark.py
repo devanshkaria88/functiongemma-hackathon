@@ -416,6 +416,7 @@ def run_benchmark(benchmarks=None):
             "source": source,
             "predicted": result["function_calls"],
             "expected": case["expected_calls"],
+            "_debug": result.get("_debug", {}),
         })
 
     print("\n=== Benchmark Results ===\n")
@@ -448,6 +449,38 @@ def run_benchmark(benchmarks=None):
     print(f"\n{'='*50}")
     print(f"  TOTAL SCORE: {score:.1f}%")
     print(f"{'='*50}")
+
+    # Diagnostic details for cloud fallbacks and F1 < 1
+    issues = [r for r in results if r["source"] != "on-device" or r["f1"] < 1.0]
+    if issues:
+        print(f"\n--- Diagnostics ({len(issues)} cases need attention) ---\n")
+        for r in issues:
+            flags = []
+            if r["f1"] < 1.0:
+                flags.append(f"F1={r['f1']:.2f}")
+            if r["source"] != "on-device":
+                flags.append("cloud-fallback")
+            print(f"  [{r['difficulty']}] {r['name']} ({', '.join(flags)})")
+            debug = r.get("_debug", {})
+            if debug.get("path"):
+                print(f"    Path: {debug['path']}")
+            if "validation" in debug:
+                print(f"    Validation: {debug['validation']}")
+            if "local_calls" in debug:
+                for lc in debug["local_calls"]:
+                    print(f"    Local returned: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+            if "subs" in debug:
+                for sd in debug["subs"]:
+                    status = sd["status"]
+                    tool_label = sd.get("tool", "?")
+                    sub_text = sd.get("sub", "?")
+                    print(f"    Sub: \"{sub_text}\" → tool={tool_label} | {status}")
+                    for lc in sd.get("local_calls", []):
+                        print(f"      Local returned: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+            if r["f1"] < 1.0:
+                print(f"    Expected: {json.dumps(r['expected'], ensure_ascii=False)}")
+                print(f"    Got:      {json.dumps(r['predicted'], ensure_ascii=False)}")
+            print()
 
     return results
 

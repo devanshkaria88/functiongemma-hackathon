@@ -59,49 +59,54 @@ def generate_cactus(messages, tools):
             [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
             tools=cactus_tools,
             force_tools=True,
-            max_tokens=128,
+            max_tokens=256,
             stop_sequences=["<|im_end|>", "<end_of_turn>"],
+            tool_rag_top_k=2,
         )
 
         try:
             raw = json.loads(raw_str)
         except json.JSONDecodeError:
-            return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+            return {"function_calls": [], "total_time_ms": 0, "confidence": 0, "cloud_handoff": True}
 
         return {
             "function_calls": raw.get("function_calls", []),
             "total_time_ms": raw.get("total_time_ms", 0),
             "confidence": raw.get("confidence", 0),
+            "cloud_handoff": raw.get("cloud_handoff", False),
         }
     except Exception:
-        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0, "cloud_handoff": True}
 
 
-def _cactus_on_pool(pool_index, messages, tools):
+def _cactus_on_pool(pool_index, messages, tools, system_prompt=None):
     """Run cactus_complete on a specific pool model (thread-safe)."""
     try:
         model = _get_pool_model(pool_index)
         cactus_reset(model)
         cactus_tools = [{"type": "function", "function": t} for t in tools]
+        sys_msg = system_prompt or SYSTEM_PROMPT
         raw_str = cactus_complete(
             model,
-            [{"role": "system", "content": SYSTEM_PROMPT}] + messages,
+            [{"role": "system", "content": sys_msg}] + messages,
             tools=cactus_tools,
             force_tools=True,
-            max_tokens=128,
+            max_tokens=256,
             stop_sequences=["<|im_end|>", "<end_of_turn>"],
+            tool_rag_top_k=2,
         )
         try:
             raw = json.loads(raw_str)
         except json.JSONDecodeError:
-            return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+            return {"function_calls": [], "total_time_ms": 0, "confidence": 0, "cloud_handoff": True}
         return {
             "function_calls": raw.get("function_calls", []),
             "total_time_ms": raw.get("total_time_ms", 0),
             "confidence": raw.get("confidence", 0),
+            "cloud_handoff": raw.get("cloud_handoff", False),
         }
     except Exception:
-        return {"function_calls": [], "total_time_ms": 0, "confidence": 0}
+        return {"function_calls": [], "total_time_ms": 0, "confidence": 0, "cloud_handoff": True}
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +218,8 @@ def _validate(result, tools):
 
 _SPLIT_MARKERS = [", and ", " and ", ", then ", " then ", ", also ", " also ", ", plus ", " plus ", ", "]
 
+_LEADING_CONJUNCTIONS = ["and ", "then ", "also ", "plus "]
+
 
 def _split_intents(text):
     """Split a multi-intent query into individual sub-queries."""
@@ -235,22 +242,55 @@ def _split_intents(text):
     return [first] + rest_parts
 
 
-def _resolve_pronouns(sub_text, previous_calls):
-    """Replace pronouns (him/her/them) with names from previous call results."""
+def _clean_sub_query(text):
+    """Strip leading conjunctions and normalize capitalization."""
+    t = text.strip()
+    t_lower = t.lower()
+    for conj in _LEADING_CONJUNCTIONS:
+        if t_lower.startswith(conj):
+            t = t[len(conj):].strip()
+            if t and t[0].islower():
+                t = t[0].upper() + t[1:]
+            break
+    return t
+
+
+def _extract_names_from_text(text):
+    """Extract likely person names (capitalized words) from text."""
+    names = []
+    for m in re.finditer(r'\b([A-Z][a-z]+)\b', text):
+        name = m.group(1)
+        if len(name) > 1 and len(name) < 25 and name.lower() not in ("am", "pm", "i", "me"):
+            names.append(name)
+    return names
+
+
+def _resolve_pronouns(sub_text, previous_calls, previous_sub_texts=None):
+    """Replace pronouns (him/her/them) with names from previous context.
+    Uses previous_calls if available, else extracts names from previous_sub_texts.
+    """
     pronouns = ["him", "her", "them", "his", "he", "she", "they"]
     text_lower = sub_text.lower()
     has_pronoun = any(f" {p} " in f" {text_lower} " for p in pronouns)
-    if not has_pronoun or not previous_calls:
+    if not has_pronoun:
         return sub_text
 
     last_name = None
-    for call in reversed(previous_calls):
-        for val in call.get("arguments", {}).values():
-            if isinstance(val, str) and val and val[0].isupper() and len(val) < 30:
-                last_name = val
+    if previous_calls:
+        for call in reversed(previous_calls):
+            for val in call.get("arguments", {}).values():
+                if isinstance(val, str) and val and val[0].isupper() and len(val) < 30:
+                    last_name = val
+                    break
+            if last_name:
                 break
-        if last_name:
-            break
+
+    if not last_name and previous_sub_texts:
+        for prev in reversed(previous_sub_texts):
+            names = _extract_names_from_text(prev)
+            if names:
+                last_name = names[-1]
+                break
 
     if not last_name:
         return sub_text
@@ -272,20 +312,75 @@ def _resolve_pronouns(sub_text, previous_calls):
 # VALIDATION
 # ===================================================================
 
-def _all_string_params(tool):
-    """Check if a tool only has string parameters (no integer/numeric)."""
-    for pspec in tool["parameters"]["properties"].values():
-        if pspec.get("type", "string").lower() != "string":
+import re
+
+
+def _extract_time_tuples(text):
+    """Extract (hour, minute) tuples from time expressions in text."""
+    times = []
+    for m in re.finditer(r'(\d{1,2}):(\d{2})\s*(?:AM|PM|am|pm)?\b', text):
+        h, mn = int(m.group(1)), int(m.group(2))
+        times.append((h, mn))
+    for m in re.finditer(r'(\d{1,2})\s*(?:AM|PM|am|pm)\b', text):
+        h = int(m.group(1))
+        if not any(t[0] == h for t in times):
+            times.append((h, 0))
+    return times
+
+
+def _extract_standalone_numbers(text):
+    """Extract plain numbers from text (not already part of time expressions)."""
+    nums = set()
+    for m in re.finditer(r'\d+', text):
+        nums.add(int(m.group()))
+    return nums
+
+
+def _validate_integer_args(call_args, tool, user_text):
+    """Validate integer arguments using context-aware strategies:
+    - If the tool has both 'hour' and 'minute' params, validate as a time tuple
+    - Otherwise validate each integer individually against numbers in the text
+    """
+    props = tool["parameters"]["properties"]
+    int_params = {
+        pname for pname, pspec in props.items()
+        if pspec.get("type", "string").lower() in ("integer", "number")
+    }
+
+    has_hour = "hour" in int_params and "hour" in call_args
+    has_minute = "minute" in int_params and "minute" in call_args
+
+    if has_hour and has_minute:
+        time_tuples = _extract_time_tuples(user_text)
+        pair = (int(call_args["hour"]), int(call_args["minute"]))
+        if pair not in time_tuples:
             return False
+        remaining = int_params - {"hour", "minute"}
+    else:
+        remaining = int_params
+
+    standalone_nums = _extract_standalone_numbers(user_text)
+    for pname in remaining:
+        if pname not in call_args:
+            continue
+        val = call_args[pname]
+        if not isinstance(val, (int, float)) or val < 0:
+            return False
+        if int(val) not in standalone_nums:
+            return False
+
     return True
 
 
 def _deep_validate(result, tools, user_text):
     """
-    Strict validation for local results. Only trusts local output when:
-    - Single function call
-    - Tool has only string params (integers are unreliable from FunctionGemma)
-    - All string values appear verbatim in the user's text
+    Validate local results by checking every argument value is grounded
+    in the user's text — works for ALL param types:
+      - strings: value (or first word) must appear verbatim in text
+      - integer pairs (hour+minute): validated as a time tuple from text
+      - other integers: value must appear as a number in text
+      - negative numbers: rejected outright
+      - empty/missing required args: caught by _validate
     """
     if not _validate(result, tools):
         return False
@@ -301,7 +396,7 @@ def _deep_validate(result, tools, user_text):
     if not tool:
         return False
 
-    if not _all_string_params(tool):
+    if not _validate_integer_args(args, tool, user_text):
         return False
 
     text_lower = user_text.lower()
@@ -309,15 +404,73 @@ def _deep_validate(result, tools, user_text):
         if pname not in args:
             continue
         val = args[pname]
-        if not isinstance(val, str) or len(val) == 0 or len(val) > 200:
-            return False
-        val_lower = val.lower()
-        if val_lower not in text_lower:
-            first_word = val_lower.split()[0] if val_lower.split() else ""
-            if not first_word or first_word not in text_lower:
+        ptype = pspec.get("type", "string").lower()
+
+        if ptype == "string":
+            if not isinstance(val, str) or len(val) == 0 or len(val) > 200:
+                return False
+            val_lower = val.lower()
+            if val_lower not in text_lower:
+                val_words = val_lower.split()
+                if not val_words:
+                    return False
+                ungrounded = [w for w in val_words if w not in text_lower]
+                if len(ungrounded) > 0:
+                    return False
+
+        elif ptype == "boolean":
+            if not isinstance(val, bool):
                 return False
 
     return True
+
+
+def _debug_validation(result, tools, user_text):
+    """Return a string explaining why _deep_validate failed."""
+    calls = result.get("function_calls", [])
+    if not calls:
+        return "no function calls returned"
+    if not _validate(result, tools):
+        call_names = [c.get("name", "?") for c in calls]
+        tool_names = {t["name"] for t in tools}
+        bad = [n for n in call_names if n not in tool_names]
+        if bad:
+            return f"unknown tool(s): {bad}"
+        for c in calls:
+            tool = next((t for t in tools if t["name"] == c.get("name")), None)
+            if tool:
+                required = set(tool["parameters"].get("required", []))
+                args = c.get("arguments", {})
+                missing = [r for r in required if r not in args or args[r] is None or args[r] == ""]
+                if missing:
+                    return f"missing required args {missing} for {c['name']}"
+        return "structural validation failed"
+    if len(calls) != 1:
+        return f"expected 1 call, got {len(calls)}"
+    call = calls[0]
+    args = call.get("arguments", {})
+    tool = next((t for t in tools if t["name"] == call["name"]), None)
+    if not tool:
+        return f"unknown tool: {call['name']}"
+    if not _validate_integer_args(args, tool, user_text):
+        int_args = {k: v for k, v in args.items()
+                    if tool["parameters"]["properties"].get(k, {}).get("type", "").lower() in ("integer", "number")}
+        return f"integer args failed: {int_args} vs text '{user_text}'"
+    text_lower = user_text.lower()
+    for pname, pspec in tool["parameters"]["properties"].items():
+        if pname not in args:
+            continue
+        val = args[pname]
+        ptype = pspec.get("type", "string").lower()
+        if ptype == "string":
+            if not isinstance(val, str) or len(val) == 0:
+                return f"string param '{pname}' empty or non-string: {val!r}"
+            if val.lower() not in text_lower:
+                val_words = val.lower().split()
+                ungrounded = [w for w in val_words if w not in text_lower]
+                if ungrounded:
+                    return f"string param '{pname}'={val!r} has ungrounded words: {ungrounded}"
+    return "unknown reason"
 
 
 def _count_expected_calls(text):
@@ -325,118 +478,171 @@ def _count_expected_calls(text):
     return len(_split_intents(text))
 
 
-# ===================================================================
-# HYBRID ROUTING — decompose, local-first, cloud fallback
-# ===================================================================
+def _pick_best_pass(results, tools, user_text):
+    """Given a list of cactus results from multiple passes, return the first
+    one that passes _deep_validate. Skips results where cloud_handoff is True.
+    Returns (result, pass_index) or (None, -1)."""
+    for i, r in enumerate(results):
+        if r.get("cloud_handoff", False):
+            continue
+        if _deep_validate(r, tools, user_text):
+            return r, i
+    return None, -1
 
-def _pick_best_tool(sub_text, tools):
-    """Pick the single best tool for a sub-query using keyword matching."""
-    text_lower = sub_text.lower()
-    best = None
-    best_score = -1
-    for t in tools:
-        score = 0
-        name_words = t["name"].lower().split("_")
-        for w in name_words:
-            if w in text_lower:
-                score += 3
-        desc_words = t.get("description", "").lower().split()
-        for w in desc_words:
-            if len(w) > 3 and w in text_lower:
-                score += 1
-        if score > best_score:
-            best_score = score
-            best = t
-    return best
 
+# ===================================================================
+# HYBRID ROUTING — double-pass local, cloud fallback
+# ===================================================================
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """
-    Hybrid routing with query decomposition and parallel execution:
+    Hybrid routing — double-pass FunctionGemma with probabilistic validation.
 
     SINGLE INTENT:
-      1. Try FunctionGemma → deep validate → return if trusted
-      2. Else cloud fallback
+      1. Run FunctionGemma TWICE (different prompts) + Cloud ALL in parallel
+      2. If either local pass validates via _deep_validate → return it (on-device)
+      3. Else return cloud result (already computed, no extra wait)
 
     MULTI-INTENT:
       1. Split query into sub-queries
-      2. Pick best single tool per sub-query (keyword matching)
-      3. Run ALL sub-queries on separate cactus model instances IN PARALLEL,
-         AND also run cloud in parallel as a safety net
-      4. If all local sub-queries validate → use them (fast, on-device)
-      5. If any fail → cloud result is already ready (no extra wait)
+      2. Each sub-query gets TWO local passes (parallel) + cloud safety net
+      3. For each sub, pick the first validated pass
+      4. If all subs have a valid local result → combine (on-device)
+      5. If any fail → use cloud
     """
     user_text = " ".join(m["content"] for m in messages if m["role"] == "user").strip()
     sub_queries = _split_intents(user_text)
 
     # ------------------------------------------------------------------
-    # SINGLE INTENT
+    # SINGLE INTENT — local pass 1, validate, optional pass 2, cloud
+    # background. Only ONE cactus model active at a time to avoid
+    # resource contention that causes empty/garbage outputs.
     # ------------------------------------------------------------------
     if len(sub_queries) == 1:
-        local = generate_cactus(messages, tools)
-        if _deep_validate(local, tools, user_text):
-            local["function_calls"] = [
-                {"name": c["name"], "arguments": _clean_args(c["arguments"])}
-                for c in local["function_calls"]
-            ]
-            local["source"] = "on-device"
-            return local
+        start = time.time()
 
-        cloud = generate_cloud(messages, tools)
+        with ThreadPoolExecutor(max_workers=1) as bg:
+            cloud_future = bg.submit(generate_cloud, messages, tools)
+
+            local1 = generate_cactus(messages, tools)
+            if _deep_validate(local1, tools, user_text):
+                local_done_ms = (time.time() - start) * 1000
+                local1["function_calls"] = [
+                    {"name": c["name"], "arguments": _clean_args(c["arguments"])}
+                    for c in local1["function_calls"]
+                ]
+                local1["source"] = "on-device"
+                local1["total_time_ms"] = local_done_ms
+                local1["_debug"] = {
+                    "path": "single/local-pass1",
+                    "local_calls": local1["function_calls"],
+                    "validation": "passed",
+                }
+                return local1
+
+            local2 = generate_cactus(messages, tools)
+            if _deep_validate(local2, tools, user_text):
+                local_done_ms = (time.time() - start) * 1000
+                local2["function_calls"] = [
+                    {"name": c["name"], "arguments": _clean_args(c["arguments"])}
+                    for c in local2["function_calls"]
+                ]
+                local2["source"] = "on-device"
+                local2["total_time_ms"] = local_done_ms
+                local2["_debug"] = {
+                    "path": "single/local-pass2",
+                    "local_calls": local2["function_calls"],
+                    "validation": "passed",
+                }
+                return local2
+
+            cloud = cloud_future.result()
+
+        wall_ms = (time.time() - start) * 1000
         return {
             "function_calls": cloud["function_calls"],
-            "total_time_ms": local["total_time_ms"] + cloud["total_time_ms"],
+            "total_time_ms": wall_ms,
             "source": "cloud (fallback)",
+            "_debug": {
+                "path": "single/cloud-fallback",
+                "local1_calls": local1.get("function_calls", []),
+                "local2_calls": local2.get("function_calls", []),
+                "validation_p1": _debug_validation(local1, tools, user_text),
+                "validation_p2": _debug_validation(local2, tools, user_text),
+            },
         }
 
     # ------------------------------------------------------------------
-    # MULTI-INTENT — decompose, run local + cloud ALL in parallel
+    # MULTI-INTENT — split into sub-queries, clean, resolve pronouns,
+    # run each through local sequentially (2 passes each), cloud in background
     # ------------------------------------------------------------------
+    cleaned_subs = [_clean_sub_query(s) for s in sub_queries]
     resolved_subs = []
-    for sub_text in sub_queries:
-        resolved_subs.append(_resolve_pronouns(sub_text, []))
+    for i, sub_text in enumerate(cleaned_subs):
+        prev_texts = cleaned_subs[:i]
+        resolved_subs.append(_resolve_pronouns(sub_text, [], previous_sub_texts=prev_texts))
 
     start = time.time()
     n_subs = len(resolved_subs)
-    with ThreadPoolExecutor(max_workers=n_subs + 1) as pool:
-        cloud_future = pool.submit(generate_cloud, messages, tools)
 
-        local_futures = {}
-        for i, sub_text in enumerate(resolved_subs):
+    with ThreadPoolExecutor(max_workers=1) as bg:
+        cloud_future = bg.submit(generate_cloud, messages, tools)
+
+        all_calls = []
+        all_valid = True
+        sub_debug = []
+        failed_idx = -1
+
+        for i in range(n_subs):
+            sub_text = resolved_subs[i]
             sub_msgs = [{"role": "user", "content": sub_text}]
-            best_tool = _pick_best_tool(sub_text, tools)
-            local_futures[i] = pool.submit(
-                _cactus_on_pool, i, sub_msgs, [best_tool] if best_tool else tools
-            )
 
-        local_results = {i: f.result() for i, f in local_futures.items()}
-        cloud = cloud_future.result()
-    wall_ms = (time.time() - start) * 1000
+            p1 = generate_cactus(sub_msgs, tools)
+            if not p1.get("cloud_handoff", False) and _deep_validate(p1, tools, sub_text):
+                cleaned_call = {
+                    "name": p1["function_calls"][0]["name"],
+                    "arguments": _clean_args(p1["function_calls"][0]["arguments"]),
+                }
+                all_calls.append(cleaned_call)
+                sub_debug.append({
+                    "sub": sub_text, "status": "passed", "pass": 1,
+                    "local_calls": p1.get("function_calls", []),
+                })
+                continue
 
-    all_calls = []
-    all_valid = True
-    for i in range(n_subs):
-        local = local_results[i]
-        sub_text = resolved_subs[i]
-        best_tool = _pick_best_tool(sub_text, tools)
-        tool_list = [best_tool] if best_tool else tools
+            p2 = generate_cactus(sub_msgs, tools)
+            if not p2.get("cloud_handoff", False) and _deep_validate(p2, tools, sub_text):
+                cleaned_call = {
+                    "name": p2["function_calls"][0]["name"],
+                    "arguments": _clean_args(p2["function_calls"][0]["arguments"]),
+                }
+                all_calls.append(cleaned_call)
+                sub_debug.append({
+                    "sub": sub_text, "status": "passed", "pass": 2,
+                    "local_calls": p2.get("function_calls", []),
+                })
+                continue
 
-        if _deep_validate(local, tool_list, sub_text):
-            cleaned_call = {
-                "name": local["function_calls"][0]["name"],
-                "arguments": _clean_args(local["function_calls"][0]["arguments"]),
-            }
-            all_calls.append(cleaned_call)
-        else:
             all_valid = False
+            failed_idx = i
+            sub_debug.append({
+                "sub": sub_text,
+                "status": _debug_validation(p1, tools, sub_text),
+                "local_calls_p1": p1.get("function_calls", []),
+                "local_calls_p2": p2.get("function_calls", []),
+            })
             break
 
-    if all_valid and len(all_calls) >= n_subs:
-        return {
-            "function_calls": all_calls,
-            "total_time_ms": wall_ms,
-            "source": "on-device",
-        }
+        if all_valid and len(all_calls) >= n_subs:
+            local_done_ms = (time.time() - start) * 1000
+            return {
+                "function_calls": all_calls,
+                "total_time_ms": local_done_ms,
+                "source": "on-device",
+                "_debug": {"path": "multi/all-local", "subs": sub_debug},
+            }
+
+        cloud = cloud_future.result()
 
     cloud_calls = cloud["function_calls"]
     if len(cloud_calls) < n_subs:
@@ -444,13 +650,14 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         remaining_tools = [t for t in tools if t["name"] not in used_tools]
         if remaining_tools:
             cloud2 = generate_cloud(messages, remaining_tools)
-            wall_ms += cloud2["total_time_ms"]
             cloud_calls = cloud_calls + cloud2["function_calls"]
 
+    wall_ms = (time.time() - start) * 1000
     return {
         "function_calls": cloud_calls,
         "total_time_ms": wall_ms,
         "source": "cloud (fallback)",
+        "_debug": {"path": "multi/cloud-fallback", "failed_sub": failed_idx, "subs": sub_debug},
     }
 
 

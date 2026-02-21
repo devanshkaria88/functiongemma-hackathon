@@ -21,6 +21,7 @@
 - Step 4: `cactus build --python`
 - Step 5: `cactus download google/functiongemma-270m-it --reconvert`
 - Step 6: Get cactus key from the [cactus website](https://cactuscompute.com/dashboard/api-keys)
+<!-- cactus_live_2fc6b09489a9bcb352ed794130a56ee1 -->
 - Sept 7: Run `cactus auth` and enter your token when prompted.
 - Step 8: `pip install google-genai`
 - Step 9: Obtain Gemini API key from [Google AI Studio](https://aistudio.google.com/api-keys)
