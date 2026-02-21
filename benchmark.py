@@ -7,6 +7,7 @@ import json
 from main import generate_hybrid
 
 
+
 ############## Tool definitions ##############
 
 TOOL_GET_WEATHER = {
@@ -462,25 +463,75 @@ def run_benchmark(benchmarks=None):
                 flags.append("cloud-fallback")
             print(f"  [{r['difficulty']}] {r['name']} ({', '.join(flags)})")
             debug = r.get("_debug", {})
+
             if debug.get("path"):
                 print(f"    Path: {debug['path']}")
-            if "validation" in debug:
-                print(f"    Validation: {debug['validation']}")
-            if "local_calls" in debug:
-                for lc in debug["local_calls"]:
-                    print(f"    Local returned: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+
+            # Single-intent: show what model returned and why fallback
+            if debug.get("path") == "single/cloud-fallback":
+                if debug.get("query"):
+                    print(f"    Query: \"{debug['query']}\"")
+                if debug.get("tools_passed"):
+                    print(f"    Tools passed: {debug['tools_passed']}")
+                print(f"    Pass 1: cloud_handoff={debug.get('cloud_handoff_p1')} | {debug.get('validation_p1', '?')}")
+                for lc in debug.get("local1_raw", []):
+                    print(f"      Raw: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+                if not debug.get("local1_raw"):
+                    print(f"      Raw: (empty)")
+                print(f"    Pass 2: cloud_handoff={debug.get('cloud_handoff_p2')} | {debug.get('validation_p2', '?')}")
+                for lc in debug.get("local2_raw", []):
+                    print(f"      Raw: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+                if not debug.get("local2_raw"):
+                    print(f"      Raw: (empty)")
+
+            # Multi-intent verbose
             if "subs" in debug:
                 for sd in debug["subs"]:
-                    status = sd["status"]
-                    tool_label = sd.get("tool", "?")
                     sub_text = sd.get("sub", "?")
-                    print(f"    Sub: \"{sub_text}\" → tool={tool_label} | {status}")
-                    for lc in sd.get("local_calls", []):
-                        print(f"      Local returned: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+                    status = sd.get("status", "?")
+                    print(f"    Sub: \"{sub_text}\"")
+                    if sd.get("status") == "passed":
+                        for lc in sd.get("local_calls", []):
+                            print(f"      ✓ Passed: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+                    else:
+                        if sd.get("sub_tools"):
+                            print(f"      Tools passed: {sd['sub_tools']}")
+                        print(f"      Why fallback: {status}")
+                        print(f"      Pass 1: cloud_handoff={sd.get('cloud_handoff_p1')} | {sd.get('validation_p1', '?')}")
+                        for lc in sd.get("raw_p1", []):
+                            print(f"        Raw: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+                        if not sd.get("raw_p1"):
+                            print(f"        Raw: (empty)")
+                        print(f"      Pass 2: cloud_handoff={sd.get('cloud_handoff_p2')} | {sd.get('validation_p2', '?')}")
+                        for lc in sd.get("raw_p2", []):
+                            print(f"        Raw: {lc.get('name', '?')}({json.dumps(lc.get('arguments', {}), ensure_ascii=False)})")
+                        if not sd.get("raw_p2"):
+                            print(f"        Raw: (empty)")
+
             if r["f1"] < 1.0:
                 print(f"    Expected: {json.dumps(r['expected'], ensure_ascii=False)}")
                 print(f"    Got:      {json.dumps(r['predicted'], ensure_ascii=False)}")
             print()
+
+        # Failure mode summary
+        def _all_debug_text(r):
+            d = r.get("_debug", {})
+            parts = [str(d.get("validation_p1", "")), str(d.get("validation_p2", ""))]
+            for sd in d.get("subs", []):
+                parts.append(str(sd.get("status", "")))
+            return " ".join(parts)
+
+        print("--- Failure mode summary ---")
+        empty_count = sum(1 for r in issues if "no function calls returned" in _all_debug_text(r))
+        string_count = sum(1 for r in issues if "ungrounded" in _all_debug_text(r))
+        missing_count = sum(1 for r in issues if "missing required" in _all_debug_text(r))
+        int_count = sum(1 for r in issues if "integer args failed" in _all_debug_text(r))
+        cloud_handoff_count = sum(1 for r in issues if any(sd.get("cloud_handoff_p1") or sd.get("cloud_handoff_p2") for sd in r.get("_debug", {}).get("subs", [{}])))
+        print(f"  Empty/no function calls: {empty_count}")
+        print(f"  String grounding failed (hallucinated values): {string_count}")
+        print(f"  Missing required args: {missing_count}")
+        print(f"  Integer validation failed: {int_count}")
+        print("  (Counts may overlap; a case can fail for multiple reasons)")
 
     return results
 

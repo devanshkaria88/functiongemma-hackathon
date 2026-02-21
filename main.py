@@ -424,7 +424,10 @@ def _normalize_model_output(result, tools, user_text):
     """
     Fix common FunctionGemma output errors before validation:
     - Negative integers: use abs() when the positive value appears in text
+    - Wrong integer (e.g. minutes=10 when text says "5"): use only number in text
     - Nested dicts: unpack {"minutes": {"minutes": 15}} -> {"minutes": 15}
+    - List-to-string: unwrap ["lo-fi beats"] -> "lo-fi beats" for string params
+    - String param with ungrounded words: extract grounded part (e.g. "Tom employee" -> "Tom")
     Mutates result in place.
     """
     calls = result.get("function_calls", [])
@@ -434,6 +437,7 @@ def _normalize_model_output(result, tools, user_text):
     time_tuples = _extract_time_tuples(user_text)
     standalone_nums = _extract_standalone_numbers(user_text)
     tool_map = {t["name"]: t for t in tools}
+    text_norm = user_text.lower().replace("'", "")
 
     for call in calls:
         args = call.get("arguments", {})
@@ -473,6 +477,21 @@ def _normalize_model_output(result, tools, user_text):
                             args["hour"], args["minute"] = abs(h), abs(m)
                     elif pname not in ("hour", "minute") and abs_val in standalone_nums:
                         args[pname] = abs_val
+                elif pname == "minutes" and isinstance(val, (int, float)) and val not in standalone_nums:
+                    if len(standalone_nums) == 1:
+                        args[pname] = list(standalone_nums)[0]
+
+            elif ptype == "string":
+                if isinstance(val, list) and len(val) == 1 and isinstance(val[0], str):
+                    args[pname] = val[0]
+                    val = args[pname]
+                if isinstance(val, str) and len(val) > 0 and pname in ("recipient", "query", "song", "location", "title"):
+                    val_words = val.lower().replace("'", "").split()
+                    ungrounded = [w for w in val_words if w not in text_norm]
+                    if ungrounded:
+                        grounded = [w for w in val_words if w in text_norm]
+                        if grounded:
+                            args[pname] = " ".join(grounded)
 
         call["arguments"] = args
 
@@ -556,6 +575,9 @@ def _deep_validate(result, tools, user_text):
                 continue
             val_words = val_lower.split()
             if not val_words:
+                continue
+            grounded = sum(1 for w in val_words if w in text_norm)
+            if grounded >= (len(val_words) + 1) // 2:
                 continue
             ungrounded = [w for w in val_words if w not in text_norm]
             if ungrounded:
@@ -716,8 +738,12 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             "source": "cloud (fallback)",
             "_debug": {
                 "path": "single/cloud-fallback",
-                "local1_calls": local1.get("function_calls", []),
-                "local2_calls": local2.get("function_calls", []),
+                "query": user_text,
+                "tools_passed": [t["name"] for t in local_tools],
+                "local1_raw": local1.get("function_calls", []),
+                "local2_raw": local2.get("function_calls", []),
+                "cloud_handoff_p1": local1.get("cloud_handoff", False),
+                "cloud_handoff_p2": local2.get("cloud_handoff", False),
                 "validation_p1": _debug_validation(local1, tools, user_text),
                 "validation_p2": _debug_validation(local2, tools, user_text),
             },
@@ -782,9 +808,14 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             failed_idx = i
             sub_debug.append({
                 "sub": sub_text,
+                "sub_tools": [t["name"] for t in sub_tools],
                 "status": _debug_validation(p1, tools, sub_text),
-                "local_calls_p1": p1.get("function_calls", []),
-                "local_calls_p2": p2.get("function_calls", []),
+                "validation_p1": _debug_validation(p1, tools, sub_text),
+                "validation_p2": _debug_validation(p2, tools, sub_text),
+                "raw_p1": p1.get("function_calls", []),
+                "raw_p2": p2.get("function_calls", []),
+                "cloud_handoff_p1": p1.get("cloud_handoff", False),
+                "cloud_handoff_p2": p2.get("cloud_handoff", False),
             })
             break
 
