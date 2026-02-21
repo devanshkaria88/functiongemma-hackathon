@@ -213,6 +213,34 @@ def _validate(result, tools):
 
 
 # ===================================================================
+# QUERY PRE-PROCESSING — normalize before passing to FunctionGemma
+# ===================================================================
+
+_PHRASE_REWRITES = [
+    (r"\btext\s+(\w+)\s+saying\b", r"send a message to \1 saying"),
+    (r"\btext\s+(\w+)\b", r"send a message to \1"),
+    (r"\blook up\b", "search for"),
+    (r"\bfind\s+(\w+)\s+in my contacts\b", r"search for \1 in contacts"),
+    (r"(\d+)\s+minute\s+timer\b", r"\1 minutes timer"),
+    (r"(\d+)\s+minute\s+", r"\1 minutes "),
+]
+
+
+def _preprocess_query(text):
+    """
+    Normalize query before passing to FunctionGemma to improve model comprehension.
+    - Rewrite colloquial phrases to explicit tool-matching forms
+    - Normalize time: "5 AM" -> "5:00 AM"
+    - Strip trailing punctuation
+    """
+    t = text.strip().rstrip(".,!?;:")
+    for pattern, repl in _PHRASE_REWRITES:
+        t = re.sub(pattern, repl, t, flags=re.IGNORECASE)
+    t = re.sub(r"(?<!\d)(?<!:)(\b\d{1,2})\s+(AM|PM|am|pm)\b", r"\1:00 \2", t)
+    return t.strip()
+
+
+# ===================================================================
 # QUERY DECOMPOSITION — split multi-intent into simple sub-queries
 # ===================================================================
 
@@ -336,6 +364,63 @@ def _extract_standalone_numbers(text):
     return nums
 
 
+def _normalize_model_output(result, tools, user_text):
+    """
+    Fix common FunctionGemma output errors before validation:
+    - Negative integers: use abs() when the positive value appears in text
+    - Nested dicts: unpack {"minutes": {"minutes": 15}} -> {"minutes": 15}
+    Mutates result in place.
+    """
+    calls = result.get("function_calls", [])
+    if not calls:
+        return
+
+    time_tuples = _extract_time_tuples(user_text)
+    standalone_nums = _extract_standalone_numbers(user_text)
+    tool_map = {t["name"]: t for t in tools}
+
+    for call in calls:
+        args = call.get("arguments", {})
+        tool = tool_map.get(call.get("name"))
+        if not tool:
+            continue
+
+        props = tool["parameters"]["properties"]
+        int_params = {
+            p for p, s in props.items()
+            if s.get("type", "string").lower() in ("integer", "number")
+        }
+        has_hour_minute = "hour" in int_params and "minute" in int_params
+
+        for pname, pspec in props.items():
+            if pname not in args:
+                continue
+            val = args[pname]
+            ptype = pspec.get("type", "string").lower()
+
+            if ptype in ("integer", "number"):
+                if isinstance(val, dict):
+                    inner = val.get(pname)
+                    if isinstance(inner, (int, float)):
+                        args[pname] = int(inner)
+                        val = args[pname]
+                if isinstance(val, (int, float)) and val < 0:
+                    abs_val = int(abs(val))
+                    if has_hour_minute and pname in ("hour", "minute"):
+                        h = int(args.get("hour", 0)) if isinstance(args.get("hour"), (int, float)) else 0
+                        m = int(args.get("minute", 0)) if isinstance(args.get("minute"), (int, float)) else 0
+                        if pname == "hour":
+                            h = abs_val
+                        else:
+                            m = abs_val
+                        if (abs(h), abs(m)) in time_tuples:
+                            args["hour"], args["minute"] = abs(h), abs(m)
+                    elif pname not in ("hour", "minute") and abs_val in standalone_nums:
+                        args[pname] = abs_val
+
+        call["arguments"] = args
+
+
 def _validate_integer_args(call_args, tool, user_text):
     """Validate integer arguments using context-aware strategies:
     - If the tool has both 'hour' and 'minute' params, validate as a time tuple
@@ -409,14 +494,16 @@ def _deep_validate(result, tools, user_text):
         if ptype == "string":
             if not isinstance(val, str) or len(val) == 0 or len(val) > 200:
                 return False
-            val_lower = val.lower()
-            if val_lower not in text_lower:
-                val_words = val_lower.split()
-                if not val_words:
-                    return False
-                ungrounded = [w for w in val_words if w not in text_lower]
-                if len(ungrounded) > 0:
-                    return False
+            val_lower = val.lower().replace("'", "")
+            text_norm = text_lower.replace("'", "")
+            if val_lower in text_norm:
+                continue
+            val_words = val_lower.split()
+            if not val_words:
+                continue
+            ungrounded = [w for w in val_words if w not in text_norm]
+            if ungrounded:
+                return False
 
         elif ptype == "boolean":
             if not isinstance(val, bool):
@@ -465,9 +552,11 @@ def _debug_validation(result, tools, user_text):
         if ptype == "string":
             if not isinstance(val, str) or len(val) == 0:
                 return f"string param '{pname}' empty or non-string: {val!r}"
-            if val.lower() not in text_lower:
-                val_words = val.lower().split()
-                ungrounded = [w for w in val_words if w not in text_lower]
+            val_norm = val.lower().replace("'", "")
+            text_norm = text_lower.replace("'", "")
+            if val_norm not in text_norm:
+                val_words = val_norm.split()
+                ungrounded = [w for w in val_words if w not in text_norm]
                 if ungrounded:
                     return f"string param '{pname}'={val!r} has ungrounded words: {ungrounded}"
     return "unknown reason"
@@ -485,6 +574,7 @@ def _pick_best_pass(results, tools, user_text):
     for i, r in enumerate(results):
         if r.get("cloud_handoff", False):
             continue
+        _normalize_model_output(r, tools, user_text)
         if _deep_validate(r, tools, user_text):
             return r, i
     return None, -1
@@ -510,8 +600,11 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
       4. If all subs have a valid local result → combine (on-device)
       5. If any fail → use cloud
     """
-    user_text = " ".join(m["content"] for m in messages if m["role"] == "user").strip()
+    raw_text = " ".join(m["content"] for m in messages if m["role"] == "user").strip()
+    user_text = _preprocess_query(raw_text)
     sub_queries = _split_intents(user_text)
+
+    messages_for_model = [{"role": "user", "content": user_text}]
 
     # ------------------------------------------------------------------
     # SINGLE INTENT — local pass 1, validate, optional pass 2, cloud
@@ -522,9 +615,9 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         start = time.time()
 
         with ThreadPoolExecutor(max_workers=1) as bg:
-            cloud_future = bg.submit(generate_cloud, messages, tools)
+            cloud_future = bg.submit(generate_cloud, messages_for_model, tools)
 
-            local1 = generate_cactus(messages, tools)
+            local1 = generate_cactus(messages_for_model, tools)
             if _deep_validate(local1, tools, user_text):
                 local_done_ms = (time.time() - start) * 1000
                 local1["function_calls"] = [
@@ -540,7 +633,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 }
                 return local1
 
-            local2 = generate_cactus(messages, tools)
+            local2 = generate_cactus(messages_for_model, tools)
             if _deep_validate(local2, tools, user_text):
                 local_done_ms = (time.time() - start) * 1000
                 local2["function_calls"] = [
@@ -586,7 +679,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     n_subs = len(resolved_subs)
 
     with ThreadPoolExecutor(max_workers=1) as bg:
-        cloud_future = bg.submit(generate_cloud, messages, tools)
+        cloud_future = bg.submit(generate_cloud, messages_for_model, tools)
 
         all_calls = []
         all_valid = True
@@ -598,6 +691,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             sub_msgs = [{"role": "user", "content": sub_text}]
 
             p1 = generate_cactus(sub_msgs, tools)
+            _normalize_model_output(p1, tools, sub_text)
             if not p1.get("cloud_handoff", False) and _deep_validate(p1, tools, sub_text):
                 cleaned_call = {
                     "name": p1["function_calls"][0]["name"],
@@ -611,6 +705,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                 continue
 
             p2 = generate_cactus(sub_msgs, tools)
+            _normalize_model_output(p2, tools, sub_text)
             if not p2.get("cloud_handoff", False) and _deep_validate(p2, tools, sub_text):
                 cleaned_call = {
                     "name": p2["function_calls"][0]["name"],
@@ -649,7 +744,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         used_tools = {c["name"] for c in cloud_calls}
         remaining_tools = [t for t in tools if t["name"] not in used_tools]
         if remaining_tools:
-            cloud2 = generate_cloud(messages, remaining_tools)
+            cloud2 = generate_cloud(messages_for_model, remaining_tools)
             cloud_calls = cloud_calls + cloud2["function_calls"]
 
     wall_ms = (time.time() - start) * 1000
